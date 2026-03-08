@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from joblib import dump, load
 import warnings
+
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
@@ -14,18 +15,19 @@ warnings.filterwarnings('ignore')
 CONFIG = {
     'train_npz_path': './results_phase2/train_diffusion_dataset.npz',
     'test_npz_path': './results_phase2/test_diffusion_dataset.npz',
-    
+
     'output_dir': './results_phase3',
     'scaler_path': './results_phase3/phys_scaler.joblib',
     # 【新增】：张量缓存文件路径
-    'tensor_cache_path': './results_phase3/dataloader_tensors_cache.pt', 
-    
-    'val_ratio_from_train': 0.15, 
-    
-    'batch_size': 128,  
+    'tensor_cache_path': './results_phase3/dataloader_tensors_cache.pt',
+
+    'val_ratio_from_train': 0.15,
+
+    'batch_size': 128,
     'num_workers': 4,
     'random_seed': 2026
 }
+
 
 # ==============================================================================
 # 1. 数据集类定义 (Zero-Copy Memory Optimized)
@@ -56,7 +58,7 @@ class SGCCDiffusionDataset(Dataset):
 # ==============================================================================
 def build_and_cache_tensors():
     print("[Cache-Builder] 首次运行：读取原始 NPZ 并构建绝对纯净的张量切分...")
-    
+
     train_data = np.load(CONFIG['train_npz_path'], allow_pickle=True)
     test_data = np.load(CONFIG['test_npz_path'], allow_pickle=True)
 
@@ -72,26 +74,29 @@ def build_and_cache_tensors():
     np.random.seed(CONFIG['random_seed'])
     np.random.shuffle(pure_normal_idx)
     n_val = int(len(pure_normal_idx) * CONFIG['val_ratio_from_train'])
-    
+
     diff_val_idx = pure_normal_idx[:n_val]
     diff_train_idx = pure_normal_idx[n_val:]
 
     scaler = StandardScaler()
-    scaler.fit(tr_phys[diff_train_idx]) 
+    scaler.fit(tr_phys[diff_train_idx])
     tr_phys_scaled = np.clip(scaler.transform(tr_phys), -5.0, 5.0)
     te_phys_scaled = np.clip(scaler.transform(te_phys), -5.0, 5.0)
-    
+
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     dump(scaler, CONFIG['scaler_path'])
 
     # 【核心防御】：将处理好的张量字典打包序列化
     cache_dict = {
-        'diff_train': (tr_res[diff_train_idx], tr_pat[diff_train_idx], tr_msk[diff_train_idx], tr_phys_scaled[diff_train_idx], tr_lbl[diff_train_idx], tr_cons[diff_train_idx]),
-        'diff_val': (tr_res[diff_val_idx], tr_pat[diff_val_idx], tr_msk[diff_val_idx], tr_phys_scaled[diff_val_idx], tr_lbl[diff_val_idx], tr_cons[diff_val_idx]),
+        'diff_train': (
+        tr_res[diff_train_idx], tr_pat[diff_train_idx], tr_msk[diff_train_idx], tr_phys_scaled[diff_train_idx],
+        tr_lbl[diff_train_idx], tr_cons[diff_train_idx]),
+        'diff_val': (tr_res[diff_val_idx], tr_pat[diff_val_idx], tr_msk[diff_val_idx], tr_phys_scaled[diff_val_idx],
+                     tr_lbl[diff_val_idx], tr_cons[diff_val_idx]),
         'clf_train': (tr_res, tr_pat, tr_msk, tr_phys_scaled, tr_lbl, tr_cons),
         'test': (te_res, te_pat, te_msk, te_phys_scaled, te_lbl, te_cons)
     }
-    
+
     torch.save(cache_dict, CONFIG['tensor_cache_path'])
     print(f"✅ 张量缓存已固化至: {CONFIG['tensor_cache_path']} (确保 Train/Inference 绝对对齐)")
 
@@ -123,17 +128,22 @@ def get_dataloaders(force_rebuild=False):
     test_ds = SGCCDiffusionDataset(*cache_dict['test'])
 
     # 动态挂载 DataLoader (避开多进程 Pickle 陷阱)
-    diff_train_loader = DataLoader(diff_train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=CONFIG['num_workers'], pin_memory=True)
-    diff_val_loader = DataLoader(diff_val_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
-    clf_train_loader = DataLoader(clf_train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=CONFIG['num_workers'], pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
+    diff_train_loader = DataLoader(diff_train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
+                                   num_workers=CONFIG['num_workers'], pin_memory=True)
+    diff_val_loader = DataLoader(diff_val_ds, batch_size=CONFIG['batch_size'], shuffle=False,
+                                 num_workers=CONFIG['num_workers'], pin_memory=True)
+    clf_train_loader = DataLoader(clf_train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
+                                  num_workers=CONFIG['num_workers'], pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'],
+                             pin_memory=True)
 
     print(f"    -> 纯净扩散轨: Train={len(diff_train_ds)}，Val={len(diff_val_ds)}")
     print(f"    -> 全量门控轨: Train={len(clf_train_ds)}")
     print(f"    -> 极限盲测轨: Test={len(test_ds)}")
     print("✅ 装载完毕！准备火力全开。")
-    
+
     return diff_train_loader, diff_val_loader, clf_train_loader, test_loader
+
 
 if __name__ == "__main__":
     # 首次独立运行，生成缓存

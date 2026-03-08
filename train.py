@@ -25,11 +25,11 @@ if torch.cuda.is_available():
 # ==============================================================================
 CONFIG = {
     'epochs': 100,
-    'max_lr': 3e-4,          
-    'weight_decay': 1e-2,    
+    'max_lr': 3e-4,
+    'weight_decay': 1e-2,
     'grad_clip': 1.0,
-    'patience': 20,          
-    'ema_decay': 0.9999,     
+    'patience': 20,
+    'ema_decay': 0.9999,
 
     'lambda_phys': 0.5,
     'cond_drop_prob': 0.1,
@@ -41,6 +41,7 @@ CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'seed': 2026
 }
+
 
 # ==============================================================================
 # 2. 稳健的 EMA 管理器 (防 OOM 崩溃版)
@@ -76,6 +77,7 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
+
 # ==============================================================================
 # 3. 核心计算模块
 # ==============================================================================
@@ -94,17 +96,20 @@ def setup_logger(log_dir: str):
         logger.addHandler(fh)
     return logger
 
+
 def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
 def calc_mask_aware_loss(noise_pred, noise_real, mask):
     """【数学防线】：只在 Mask == 1 的观测点上计算梯度"""
     raw_mse = F.mse_loss(noise_pred, noise_real, reduction='none')
     masked_mse = (raw_mse * mask).sum() / (mask.sum() + 1e-8)
     return masked_mse
+
 
 def save_checkpoint_diffusion(diffusion_model, optimizer, epoch, loss, path, extra=None, is_ema=False):
     """【修复】：保存完整的 diffusion_model，保住 null_phys_emb 参数"""
@@ -118,6 +123,7 @@ def save_checkpoint_diffusion(diffusion_model, optimizer, epoch, loss, path, ext
     if extra: ckpt.update(extra)
     torch.save(ckpt, path)
 
+
 # ==============================================================================
 # 4. 训练与验证流 (极速异步版)
 # ==============================================================================
@@ -126,7 +132,7 @@ def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device
     phys_criterion = nn.MSELoss()
     total_loss, total_diff_loss, total_phys_loss = 0.0, 0.0, 0.0
     use_amp = (device.type == "cuda")
-    
+
     pbar = tqdm(loader, desc=f"Epoch {epoch:03d}/{CONFIG['epochs']:03d} [Train]", leave=False)
 
     for residuals, patched, masks, phys_feats, labels, cons_nos in pbar:
@@ -141,19 +147,19 @@ def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device
             noise_pred, noise_real, pred_phys0 = diffusion(residuals, masks, t, phys_feats)
 
             loss_diff = calc_mask_aware_loss(noise_pred, noise_real, masks)
-            real_phys0 = phys_feats[:, 0].unsqueeze(1) 
+            real_phys0 = phys_feats[:, 0].unsqueeze(1)
             loss_phys = phys_criterion(pred_phys0, real_phys0)
 
             loss = loss_diff + CONFIG['lambda_phys'] * loss_phys
 
         grad_scaler.scale(loss).backward()
-        
+
         grad_scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(diffusion.parameters(), CONFIG['grad_clip'])
-        
+
         grad_scaler.step(optimizer)
         grad_scaler.update()
-        
+
         scheduler.step()
         ema.update()
 
@@ -171,20 +177,21 @@ def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device
     )
     return avg_loss
 
+
 @torch.no_grad()
 def validate(diffusion, loader, device, epoch, logger, ema=None):
     if loader is None: return float('inf')
-    
+
     # 强制固定验证集上的时间步加噪，保证 Loss 具有绝对可比性
     torch.manual_seed(CONFIG['seed'])
 
     if ema is not None: ema.apply_shadow()
     diffusion.eval()
-    
+
     phys_criterion = nn.MSELoss()
     total_loss = 0.0
 
-    try: 
+    try:
         pbar = tqdm(loader, desc=f"Epoch {epoch:03d}/{CONFIG['epochs']:03d} [Valid]", leave=False)
         for residuals, patched, masks, phys_feats, labels, cons_nos in pbar:
             residuals = residuals.to(device, non_blocking=True)
@@ -192,10 +199,10 @@ def validate(diffusion, loader, device, epoch, logger, ema=None):
             phys_feats = phys_feats.to(device, non_blocking=True)
 
             t = torch.randint(0, diffusion.timesteps, (residuals.shape[0],), device=device).long()
-            
+
             original_drop_prob = diffusion.cond_drop_prob
-            diffusion.cond_drop_prob = 0.0 
-            
+            diffusion.cond_drop_prob = 0.0
+
             noise_pred, noise_real, pred_phys0 = diffusion(residuals, masks, t, phys_feats)
             diffusion.cond_drop_prob = original_drop_prob
 
@@ -208,12 +215,13 @@ def validate(diffusion, loader, device, epoch, logger, ema=None):
 
     finally:
         if ema is not None: ema.restore()
-        
+
     avg_loss = total_loss / max(1, len(loader))
     # 恢复系统的随机性
     torch.manual_seed(int(time.time()))
     logger.info(f"[Val]   Epoch {epoch:03d}: Loss={avg_loss:.5f} {'(EMA)' if ema else ''}")
     return avg_loss
+
 
 # ==============================================================================
 # 5. 主程序入口
@@ -237,7 +245,7 @@ def main():
 
     unet = PhysicsAwareUNet1D(in_channels=2, out_channels=1, base_dim=64, phys_dim=6).to(device)
     diffusion = GaussianDiffusion1D(
-        unet, seq_length=256, timesteps=1000, 
+        unet, seq_length=256, timesteps=1000,
         cond_drop_prob=CONFIG['cond_drop_prob'], phys_dim=6
     ).to(device)
 
@@ -245,16 +253,16 @@ def main():
     optimizer = optim.AdamW(diffusion.parameters(), lr=CONFIG['max_lr'], weight_decay=CONFIG['weight_decay'])
 
     scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=CONFIG['max_lr'], 
-        epochs=CONFIG['epochs'], 
+        optimizer,
+        max_lr=CONFIG['max_lr'],
+        epochs=CONFIG['epochs'],
         steps_per_epoch=len(diff_train_dl),
-        pct_start=0.1,         
-        anneal_strategy='cos', 
+        pct_start=0.1,
+        anneal_strategy='cos',
         div_factor=25.0,
         final_div_factor=1000.0
     )
-    
+
     grad_scaler = GradScaler('cuda', enabled=(device.type == "cuda"))
 
     best_val_loss = float('inf')
@@ -265,20 +273,22 @@ def main():
 
     for epoch in range(1, CONFIG['epochs'] + 1):
         # 【核心修正】：喂入 diff_train_dl 和 diff_val_dl
-        train_loss = train_one_epoch(diffusion, diff_train_dl, optimizer, scheduler, grad_scaler, device, epoch, logger, ema)
+        train_loss = train_one_epoch(diffusion, diff_train_dl, optimizer, scheduler, grad_scaler, device, epoch, logger,
+                                     ema)
         val_loss = validate(diffusion, diff_val_dl, device, epoch, logger, ema=ema)
 
         status_str = ""
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            
+
             ema.apply_shadow()
             save_path = os.path.join(CONFIG['save_dir'], 'best_model.pth')
             # 保存整个 diffusion 容器
-            save_checkpoint_diffusion(diffusion, optimizer, epoch, val_loss, save_path, extra={'experiment_name': CONFIG['experiment_name']}, is_ema=True)
+            save_checkpoint_diffusion(diffusion, optimizer, epoch, val_loss, save_path,
+                                      extra={'experiment_name': CONFIG['experiment_name']}, is_ema=True)
             ema.restore()
-            
+
             logger.info(f"✨ New SOTA Checkpoint! (Val Loss: {val_loss:.5f})")
             status_str = "✨ BEST MODEL"
         else:
@@ -298,6 +308,7 @@ def main():
     total_time = time.time() - start_time
     logger.info(f"✅ Mission Accomplished in {total_time / 3600:.2f} hours.")
     logger.info(f"🏆 Ultimate Validation Loss: {best_val_loss:.5f}")
+
 
 if __name__ == "__main__":
     main()
