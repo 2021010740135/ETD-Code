@@ -3,27 +3,29 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+# 【核心升级】：弃用 StandardScaler，采用对极值免疫的 RobustScaler
+from sklearn.preprocessing import RobustScaler
 from joblib import dump, load
 import warnings
 
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. 全局配置 (双轨隔离 & 缓存热重载版)
+# 0. 全局配置 (双轨隔离 & 鲁棒缓存热重载版)
 # ==============================================================================
 CONFIG = {
     'train_npz_path': './results_phase2/train_diffusion_dataset.npz',
     'test_npz_path': './results_phase2/test_diffusion_dataset.npz',
 
     'output_dir': './results_phase3',
-    'scaler_path': './results_phase3/phys_scaler.joblib',
-    # 【新增】：张量缓存文件路径
-    'tensor_cache_path': './results_phase3/dataloader_tensors_cache.pt',
+    'scaler_path': './results_phase3/phys_robust_scaler.joblib',
+    # 【强制刷新】：更改缓存名称，确保读取到包含脏数据并实施防波堤截断的最新张量！
+    'tensor_cache_path': './results_phase3/dataloader_tensors_cache_v3_fp16_safe.pt',
 
     'val_ratio_from_train': 0.15,
 
-    'batch_size': 128,
+    # 4090 显存极大，256 的 Batch Size 可以轻松吃下并加快训练
+    'batch_size': 256, 
     'num_workers': 4,
     'random_seed': 2026
 }
@@ -70,6 +72,25 @@ def build_and_cache_tensors():
     te_res, te_pat = test_data['x_residual'], test_data['x_patched']
     te_msk, te_phys = test_data['x_mask'], test_data['phys_feat']
 
+    # ======================================================================
+    # 【新增终极防线】：时序波幅硬截断 (Hard Clipping)
+    # 保护原始时序残差不被物理破坏产生的超级极值拉爆，确保处于 4090 FP16 安全区
+    # ======================================================================
+    print("🛡️  执行波幅防波堤防御：拦截极端时序突刺，保护 4090 FP16 计算不溢出...")
+    tr_res = np.nan_to_num(tr_res, nan=0.0, posinf=50.0, neginf=-50.0)
+    te_res = np.nan_to_num(te_res, nan=0.0, posinf=50.0, neginf=-50.0)
+    
+    # 物理意义：将最大波动限制在 50 倍基准值内。此范围对捕获窃电绰绰有余，且平方后仅 2500，绝对安全。
+    tr_res = np.clip(tr_res, -50.0, 50.0)
+    te_res = np.clip(te_res, -50.0, 50.0)
+    # ======================================================================
+
+    # 【底层防御】：由于 Phase 1 保留了极端脏数据，物理特征中必定潜伏着 NaN 和 Inf
+    # 必须在此将其物理意义化（填补为 0，代表此维度无特征或处于断电状态），斩断崩溃源头
+    print("🛡️  执行脏数据底层防御：清洗物理特征矩阵中的 NaN 与 Inf...")
+    tr_phys = np.nan_to_num(tr_phys, nan=0.0, posinf=0.0, neginf=0.0)
+    te_phys = np.nan_to_num(te_phys, nan=0.0, posinf=0.0, neginf=0.0)
+
     pure_normal_idx = np.where(tr_lbl == 0)[0]
     np.random.seed(CONFIG['random_seed'])
     np.random.shuffle(pure_normal_idx)
@@ -78,8 +99,12 @@ def build_and_cache_tensors():
     diff_val_idx = pure_normal_idx[:n_val]
     diff_train_idx = pure_normal_idx[n_val:]
 
-    scaler = StandardScaler()
+    # 【数学引擎升级】：改用 RobustScaler，利用中位数抗击极值毒化！
+    print("📈 初始化抗毒化缩放器 (RobustScaler) 以保护正常特征流形...")
+    scaler = RobustScaler()
     scaler.fit(tr_phys[diff_train_idx])
+    
+    # 将其放缩并安全截断在 [-5.0, 5.0] 的置信区间内
     tr_phys_scaled = np.clip(scaler.transform(tr_phys), -5.0, 5.0)
     te_phys_scaled = np.clip(scaler.transform(te_phys), -5.0, 5.0)
 
@@ -110,7 +135,7 @@ def get_dataloaders(force_rebuild=False):
     若缓存存在，0.1秒瞬间装载；若不存在，则构建缓存。
     """
     print("=" * 80)
-    print("🚀 [Phase 3] 零污染张量装载管线启动 (Asymmetric Dual-Track Mode)")
+    print("🚀 [Phase 3] 零污染抗毒化张量装载管线启动 (Robust Dual-Track Mode)")
     print("=" * 80)
 
     if force_rebuild or not os.path.exists(CONFIG['tensor_cache_path']):
@@ -127,7 +152,7 @@ def get_dataloaders(force_rebuild=False):
     clf_train_ds = SGCCDiffusionDataset(*cache_dict['clf_train'])
     test_ds = SGCCDiffusionDataset(*cache_dict['test'])
 
-    # 动态挂载 DataLoader (避开多进程 Pickle 陷阱)
+    # 动态挂载 DataLoader
     diff_train_loader = DataLoader(diff_train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
                                    num_workers=CONFIG['num_workers'], pin_memory=True)
     diff_val_loader = DataLoader(diff_val_ds, batch_size=CONFIG['batch_size'], shuffle=False,
@@ -137,9 +162,9 @@ def get_dataloaders(force_rebuild=False):
     test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'],
                              pin_memory=True)
 
-    print(f"    -> 纯净扩散轨: Train={len(diff_train_ds)}，Val={len(diff_val_ds)}")
-    print(f"    -> 全量门控轨: Train={len(clf_train_ds)}")
-    print(f"    -> 极限盲测轨: Test={len(test_ds)}")
+    print(f"    -> 纯净扩散轨 (已过滤脏数据): Train={len(diff_train_ds)}，Val={len(diff_val_ds)}")
+    print(f"    -> 全量门控轨 (含极值与缺失): Train={len(clf_train_ds)}")
+    print(f"    -> 极限盲测轨 (含极值与缺失): Test={len(test_ds)}")
     print("✅ 装载完毕！准备火力全开。")
 
     return diff_train_loader, diff_val_loader, clf_train_loader, test_loader

@@ -1,4 +1,4 @@
-# inference_and_temporal_fusion_v2.py
+# inference.py
 import os
 import time
 import numpy as np
@@ -21,7 +21,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. 推理与时序融合配置 (Kaggle 极限榨汁版 - F1 & AUC 双料王)
+# 0. 推理与时序融合配置 (520维全模态榨汁版)
 # ==============================================================================
 CONFIG = {
     'model_path': './checkpoints/best_model.pth',
@@ -32,36 +32,28 @@ CONFIG = {
     'ddim_steps': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 
-    'fusion_epochs': 50,  # 每折 Epoch 略降，防止弱分类器过拟合，依赖外层集成
-    'fusion_lr': 4e-4,  # 学习率微调，配合更大的 Weight Decay
+    'fusion_epochs': 50,  
+    'fusion_lr': 4e-4,  
     'fusion_batch_size': 64,
     'fusion_hidden_dim': 128,
 
-    'focal_alpha': 0.70,  # 【榨汁点2】: 回调至 0.70，减少对负样本的极度打压，利于 Precision
-    'focal_gamma': 2.5,  # 【榨汁点3】: 从 3.0 软化到 2.5，让模型也能兼顾“中等难度”的样本，拉升 Recall
+    'focal_alpha': 0.70,  
+    'focal_gamma': 2.5,  
 
     'latent_dim': 512,
     'phys_dim': 6,
-    'input_dim': 519,
+    # 【核心升维】：512(潜空间) + 1(MSE) + 6(物理) + 1(缺失率) = 520
+    'input_dim': 520,
 
     'inspection_budget': 0.10,
-    # 取消绝对 Precision 硬约束，改为动态寻优底线
     'min_precision_bound': 0.45,
     'seed': 42
 }
 
 
 def print_model_summary(model, name="Model"):
-    """
-    打印模型参数量和估算大小 (MB)
-    """
-    # 统计总参数量
     total_params = sum(p.numel() for p in model.parameters())
-    # 统计可训练参数量
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # 计算模型大小 (假设是 float32, 每个参数 4 bytes)
-    # param.element_size() 会自动获取数据类型的字节数
     param_size = sum(p.numel() * p.element_size() for p in model.parameters())
     buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
     size_all_mb = (param_size + buffer_size) / 1024 ** 2
@@ -82,7 +74,7 @@ def set_seed(seed):
 
 
 # ==============================================================================
-# 1. 提取满血 519 维深层特征 (调用 DDIM 重构引擎)
+# 1. 提取满血 520 维深层特征 (调用 DDIM 重构引擎)
 # ==============================================================================
 def load_diffusion_model(path, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -99,7 +91,7 @@ def load_diffusion_model(path, device):
 
 
 def extract_features_from_loader(diffusion, loader, device, desc):
-    print(f"🚀 Extracting {desc} 519-Dim Representations...")
+    print(f"🚀 Extracting {desc} 520-Dim Representations (Including Missing Ratio)...")
     rows = []
 
     with torch.no_grad():
@@ -113,13 +105,18 @@ def extract_features_from_loader(diffusion, loader, device, desc):
                 noise_level=CONFIG['t_extract'], ddim_steps=CONFIG['ddim_steps']
             )
 
+            # 【核心体现 1】：动态计算当前窗口的缺失率 (Missing Ratio)
+            # masks 中 1代表有数据，0代表缺失。 1.0 - mean() 就是缺失率
+            missing_ratios = 1.0 - masks.float().mean(dim=(1, 2)).cpu().numpy()
+
             lat_np = latent_features.cpu().numpy()
             phys_np = phys_feats.cpu().numpy()
             mse_np = mse_scores.cpu().numpy()
             lbl_np = labels.cpu().numpy()
 
             for i in range(B):
-                feat_vec = np.concatenate([lat_np[i], [mse_np[i]], phys_np[i]])
+                # 【核心体现 2】：将 missing_ratios 拼接到最后，特征正式从 519维 升级为 520维！
+                feat_vec = np.concatenate([lat_np[i], [mse_np[i]], phys_np[i], [missing_ratios[i]]])
                 rows.append({'cons_no': cons_nos[i], 'label': int(lbl_np[i]), 'features': feat_vec})
 
     return pd.DataFrame(rows)
@@ -160,8 +157,10 @@ class PhysicsGatedTemporalFusionNet(nn.Module):
             nn.Sigmoid()
         )
 
+        # 【核心体现 3】：扩大输入映射层的维度 
+        # 容纳: 512(Latent) + 6(Phys) + 1(MSE) + 1(Missing Ratio)
         self.input_projection = nn.Sequential(
-            nn.Linear(latent_dim + phys_dim + 1, hidden_dim),
+            nn.Linear(latent_dim + phys_dim + 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(0.3)
@@ -169,11 +168,10 @@ class PhysicsGatedTemporalFusionNet(nn.Module):
 
         self.pos_embedding = nn.Parameter(torch.randn(1, 256, hidden_dim) * 0.02)
 
-        # 【榨汁点4】: 标准 Transformer 的前馈层放大倍数应为 4 倍 (隐藏层 128 -> 512)，提升特征捕获容量！
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,  # <-- 从 2 改为 4
+            dim_feedforward=hidden_dim * 4,
             dropout=0.3,
             activation='gelu',
             batch_first=True
@@ -195,14 +193,19 @@ class PhysicsGatedTemporalFusionNet(nn.Module):
         )
 
     def forward(self, x, mask):
+        # x.shape is [B, SeqLen, 520]
         latent_features = x[:, :, :self.latent_dim]
-        mse_score = x[:, :, self.latent_dim:self.latent_dim + 1]
-        physics_features = x[:, :, self.latent_dim + 1:]
+        mse_score = x[:, :, self.latent_dim : self.latent_dim+1]
+        physics_features = x[:, :, self.latent_dim+1 : self.latent_dim+1+self.phys_dim]
+        
+        # 【核心体现 4】：切片剥离出最后一维的 Missing Ratio
+        missing_ratio = x[:, :, -1:]
 
         gate_weights = self.physics_gate(physics_features)
         gated_latent = latent_features * gate_weights
 
-        fused_x = torch.cat([gated_latent, mse_score, physics_features], dim=-1)
+        # 【核心体现 5】：将 Missing Ratio 与其他特征联合拼接，送入 Transformer
+        fused_x = torch.cat([gated_latent, mse_score, physics_features, missing_ratio], dim=-1)
         x_emb = self.input_projection(fused_x)
 
         seq_len = x_emb.size(1)
@@ -212,7 +215,7 @@ class PhysicsGatedTemporalFusionNet(nn.Module):
         trans_out = self.transformer(x_emb, src_key_padding_mask=padding_mask)
 
         attn_weights = self.temporal_attention(trans_out).squeeze(-1)
-        attn_weights = attn_weights.masked_fill(mask == 0, -1e9)
+        attn_weights = attn_weights.masked_fill(mask == 0, -1e4)
         alpha = F.softmax(attn_weights, dim=1)
 
         context = torch.sum(trans_out * alpha.unsqueeze(-1), dim=1)
@@ -254,9 +257,6 @@ def train_ensemble_and_blind_test(X_tr, y_tr, m_tr, X_te, y_te, m_te, output_dir
         print(f"--- Training Base Model {k + 1}/{CONFIG['ensemble_k']} ---")
         np.random.shuffle(neg_idx)
 
-        # 【榨汁点5】: 动态非对称对抗采样 (Dynamic Asymmetric Bagging)
-        # 抛弃固定的 1:2，让每个弱分类器看到的正常样本比例在 1:1.5 到 1:3.5 之间随机波动！
-        # 这会极大提升 Ensemble 的多样性，使得模型不仅能抓到明显的贼，也能排查隐蔽的贼。
         dynamic_ratio = np.random.uniform(1.5, 3.5)
         num_neg_sample = min(len(neg_idx), int(len(pos_idx) * dynamic_ratio))
         bag_neg = neg_idx[:num_neg_sample]
@@ -276,11 +276,10 @@ def train_ensemble_and_blind_test(X_tr, y_tr, m_tr, X_te, y_te, m_te, output_dir
 
         model = PhysicsGatedTemporalFusionNet(latent_dim=CONFIG['latent_dim'], phys_dim=CONFIG['phys_dim'],
                                               hidden_dim=CONFIG['fusion_hidden_dim']).to(device)
-        # 【新增】只在第一次集成时打印一次分类网络的大小
+        
         if k == 0:
-            print_model_summary(model, name="Physics-Gated Fusion Net")
+            print_model_summary(model, name="Physics-Gated Fusion Net (520-Dim)")
 
-        # 【榨汁点6】: 增加 Weight Decay (1e-3 -> 1e-2)，防止 Transformer 在小样本下过拟合
         optimizer = optim.AdamW(model.parameters(), lr=CONFIG['fusion_lr'], weight_decay=1e-2)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['fusion_epochs'])
 
@@ -330,32 +329,24 @@ def train_ensemble_and_blind_test(X_tr, y_tr, m_tr, X_te, y_te, m_te, output_dir
     ens_probs /= CONFIG['ensemble_k']
     all_attention_weights /= CONFIG['ensemble_k']
 
-    # 【核心：PR-AUC 与 全局 F1 最大化寻优】
     fpr, tpr, roc_thresh = roc_curve(y_te, ens_probs)
     prec, rec, pr_thresh = precision_recall_curve(y_te, ens_probs)
 
     roc_auc = auc(fpr, tpr)
     pr_auc = average_precision_score(y_te, ens_probs)
 
-    # 1. 计算 Precision@K (模拟电网实地稽查预算)
     num_inspect = max(1, int(len(y_te) * CONFIG['inspection_budget']))
     top_k_indices = np.argsort(ens_probs)[::-1][:num_inspect]
     precision_at_k = y_te[top_k_indices].mean()
     recall_at_k = y_te[top_k_indices].sum() / y_te.sum()
 
-    # 2. 【榨汁点7】: 全局 F1 寻优引擎！
-    # 计算每个阈值下的 F1 分数
     f1_scores = 2 * (prec[:-1] * rec[:-1]) / (prec[:-1] + rec[:-1] + 1e-8)
-
-    # 我们希望 F1 最大化，但同时 Precision 不能崩溃（保住业务底线）
     valid_indices = np.where(prec[:-1] >= CONFIG['min_precision_bound'])[0]
 
     if len(valid_indices) > 0:
-        # 在满足最低查准率的前提下，寻找 F1 最高点！
         best_idx = valid_indices[np.argmax(f1_scores[valid_indices])]
         opt_thresh = pr_thresh[best_idx]
     else:
-        # 如果极度困难，直接回退到全局 F1 最高点
         opt_thresh = pr_thresh[np.argmax(f1_scores)]
 
     final_preds = (ens_probs >= opt_thresh).astype(int)
@@ -365,21 +356,29 @@ def train_ensemble_and_blind_test(X_tr, y_tr, m_tr, X_te, y_te, m_te, output_dir
     final_recall = tp / (tp + fn + 1e-8)
     final_f1 = 2 * (final_precision * final_recall) / (final_precision + final_recall + 1e-8)
 
-    print(f"🌟 ROC-AUC        : {roc_auc:.4f} (基准区分度)")
-    print(f"🌟 PR-AUC         : {pr_auc:.4f} (极度不平衡下的黄金指标)")
-    print("-" * 65)
-    print(f"💰 经济稽查模拟 (预算 {CONFIG['inspection_budget'] * 100}% 用户)")
-    print(f"   -> Precision@K : {precision_at_k:.4f}")
-    print(f"   -> Recall@K    : {recall_at_k:.4f}")
-    print("-" * 65)
-    print(f"🎯 F1 峰值寻优阈值 (Threshold = {opt_thresh:.3f})")
-    print(f"   -> True Positives (抓获) : {tp}")
-    print(f"   -> False Positives(误报) : {fp}")
-    print(f"   -> False Negatives(漏网) : {fn}")
-    print(f"   -> 🚀 Precision          : {final_precision:.4f}")
-    print(f"   -> 🚀 Recall             : {final_recall:.4f}")
-    print(f"   -> 🏆 F1-Score           : {final_f1:.4f} (全面碾压对比模型！)")
-    print("=" * 65)
+# ---------------------------------------------------------
+    # Academic-Style Evaluation Metrics Logging
+    # ---------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("[Phase 4] Global Performance Evaluation Metrics")
+    print("=" * 70)
+    print(f"Area Under ROC Curve (ROC-AUC)      : {roc_auc:.4f}")
+    print(f"Area Under PR Curve  (PR-AUC)       : {pr_auc:.4f}")
+    print("-" * 70)
+    print(f"[Cost-Sensitive Inspection Simulation | Budget: Top {CONFIG['inspection_budget'] * 100:.0f}%]")
+    print(f"Precision@Budget                    : {precision_at_k:.4f}")
+    print(f"Recall@Budget                       : {recall_at_k:.4f}")
+    print("-" * 70)
+    print(f"[Optimal Operating Point Calibration | Threshold = {opt_thresh:.4f}]")
+    print(f"True Positives  (TP)                : {tp}")
+    print(f"False Positives (FP)                : {fp} (False Alarms)")
+    print(f"False Negatives (FN)                : {fn} (Missed Detections)")
+    print(f"True Negatives  (TN)                : {tn}")
+    print("-" * 70)
+    print(f"Calibrated Precision                : {final_precision:.4f}")
+    print(f"Calibrated Recall                   : {final_recall:.4f}")
+    print(f"Maximum F1-Score                    : {final_f1:.4f}")
+    print("=" * 70 + "\n")
 
     np.save(os.path.join(output_dir, 'attention_weights_test.npy'), all_attention_weights)
     pd.DataFrame({'cons_no': np.arange(len(y_te)), 'true_label': y_te, 'prob': ens_probs}).to_csv(
@@ -390,15 +389,16 @@ if __name__ == "__main__":
     set_seed(CONFIG['seed'])
     device = torch.device(CONFIG['device'])
 
-    cache_file = os.path.join(CONFIG['output_dir'], f"extracted_features_cache_t{CONFIG['t_extract']}_ddim.npz")
+    # 【缓存刷新】：更改缓存名，强制重新提取包含缺失率的 520 维特征！
+    cache_file = os.path.join(CONFIG['output_dir'], f"extracted_features_cache_t{CONFIG['t_extract']}_ddim_v520.npz")
 
     if os.path.exists(cache_file):
-        print(f"📦 发现版本匹配的特征缓存 ({cache_file})！秒级启动...")
+        print(f"📦 发现版本匹配的 520 维特征缓存 ({cache_file})！秒级启动...")
         data = np.load(cache_file, allow_pickle=True)
         X_tr, y_tr, m_tr = data['X_tr'], data['y_tr'], data['m_tr']
         X_te, y_te, m_te = data['X_te'], data['y_te'], data['m_te']
     else:
-        print(f"⚙️ 重构建特征缓存 (DDIM 加速版)...")
+        print(f"⚙️ 重构建特征缓存 (520维全模态版)...")
         diffusion = load_diffusion_model(CONFIG['model_path'], device)
         print_model_summary(diffusion, name="Physics-Aware Diffusion Engine")
 

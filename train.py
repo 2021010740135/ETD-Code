@@ -14,14 +14,14 @@ from data_loader import get_dataloaders
 from model import PhysicsAwareUNet1D, GaussianDiffusion1D
 import torch.nn.functional as F
 
-# 【极客优化】：开启 TF32 矩阵乘法加速 (Ampere及以上架构 GPU 速度提升 30%+)
+# 【极客优化】：开启 RTX 4090 TF32 矩阵乘法加速 (Ampere及以上架构 GPU 速度提升 30%+)
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
 # ==============================================================================
-# 1. 训练配置 (ICPC 竞赛级调参)
+# 1. 训练配置 (4090 单卡极限榨汁版)
 # ==============================================================================
 CONFIG = {
     'epochs': 100,
@@ -112,7 +112,6 @@ def calc_mask_aware_loss(noise_pred, noise_real, mask):
 
 
 def save_checkpoint_diffusion(diffusion_model, optimizer, epoch, loss, path, extra=None, is_ema=False):
-    """【修复】：保存完整的 diffusion_model，保住 null_phys_emb 参数"""
     ckpt = {
         'epoch': epoch,
         'model_state_dict': diffusion_model.state_dict(),
@@ -144,11 +143,13 @@ def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device
         optimizer.zero_grad(set_to_none=True)
 
         with autocast('cuda', enabled=use_amp):
-            noise_pred, noise_real, pred_phys0 = diffusion(residuals, masks, t, phys_feats)
+            # 【核心对齐】：接收 6 维预测结果
+            noise_pred, noise_real, pred_phys = diffusion(residuals, masks, t, phys_feats)
 
             loss_diff = calc_mask_aware_loss(noise_pred, noise_real, masks)
-            real_phys0 = phys_feats[:, 0].unsqueeze(1)
-            loss_phys = phys_criterion(pred_phys0, real_phys0)
+            
+            # 【核心对齐】：废弃以前只取第 0 维的逻辑，直接算 6 维物理特征的全局 MSE！
+            loss_phys = phys_criterion(pred_phys, phys_feats)
 
             loss = loss_diff + CONFIG['lambda_phys'] * loss_phys
 
@@ -203,12 +204,14 @@ def validate(diffusion, loader, device, epoch, logger, ema=None):
             original_drop_prob = diffusion.cond_drop_prob
             diffusion.cond_drop_prob = 0.0
 
-            noise_pred, noise_real, pred_phys0 = diffusion(residuals, masks, t, phys_feats)
+            # 【核心对齐】
+            noise_pred, noise_real, pred_phys = diffusion(residuals, masks, t, phys_feats)
             diffusion.cond_drop_prob = original_drop_prob
 
             loss_diff = calc_mask_aware_loss(noise_pred, noise_real, masks)
-            real_phys0 = phys_feats[:, 0].unsqueeze(1)
-            loss_phys = phys_criterion(pred_phys0, real_phys0)
+            
+            # 【核心对齐】：验证集同步执行 6 维物理 Loss
+            loss_phys = phys_criterion(pred_phys, phys_feats)
 
             loss = loss_diff + CONFIG['lambda_phys'] * loss_phys
             total_loss += float(loss.item())
@@ -230,7 +233,7 @@ def main():
     set_seed(CONFIG['seed'])
     logger = setup_logger(CONFIG['log_dir'])
     device = torch.device(CONFIG['device'])
-    logger.info(f"🚀 Initializing High-Performance Training Pipeline on {device}")
+    logger.info(f"🚀 Initializing High-Performance Training Pipeline on Single GPU: {device} (RTX 4090 TF32 Enabled)")
 
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
     summary_txt = "epoch_results.txt"
@@ -240,7 +243,7 @@ def main():
         f.write(f"{'Epoch':<8} | {'Train Loss':<12} | {'Val Loss':<12} | {'Status':<20}\n")
         f.write("-" * 65 + "\n")
 
-    # 【对齐管线】：接入双轨数据，严格提取纯净的扩散专属 loader
+    # 接入双轨数据
     diff_train_dl, diff_val_dl, clf_train_dl, test_dl = get_dataloaders()
 
     unet = PhysicsAwareUNet1D(in_channels=2, out_channels=1, base_dim=64, phys_dim=6).to(device)
@@ -272,9 +275,7 @@ def main():
     start_time = time.time()
 
     for epoch in range(1, CONFIG['epochs'] + 1):
-        # 【核心修正】：喂入 diff_train_dl 和 diff_val_dl
-        train_loss = train_one_epoch(diffusion, diff_train_dl, optimizer, scheduler, grad_scaler, device, epoch, logger,
-                                     ema)
+        train_loss = train_one_epoch(diffusion, diff_train_dl, optimizer, scheduler, grad_scaler, device, epoch, logger, ema)
         val_loss = validate(diffusion, diff_val_dl, device, epoch, logger, ema=ema)
 
         status_str = ""
