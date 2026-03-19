@@ -5,9 +5,6 @@ import math
 import numpy as np
 
 
-# ==============================================================================
-# 1. 基础组件 (DiT级 SOTA 升级)
-# ==============================================================================
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -25,7 +22,6 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class AdaLNZero(nn.Module):
-    """【SCI重构】: 引入 DiT 的核心机制 AdaLN-Zero，完美融合物理先验与时间步"""
     def __init__(self, cond_dim: int, channels: int):
         super().__init__()
         self.silu = nn.SiLU()
@@ -41,7 +37,6 @@ class AdaLNZero(nn.Module):
 
 
 class ConvNeXtBlock1D(nn.Module):
-    """【SCI重构】: 采用 7x7 大核卷积 (Large Kernel) 捕捉长程压降突刺"""
     def __init__(self, in_channels: int, out_channels: int, cond_dim: int, dropout: float = 0.1):
         super().__init__()
         # Depthwise 大核卷积，极大地扩充感受野
@@ -74,6 +69,7 @@ class Downsample1D(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor: return self.conv(x)
 
 
@@ -81,27 +77,30 @@ class Upsample1D(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor: return self.conv(x)
 
 
 class TemporalAttentionPool(nn.Module):
-    """【核心对齐】: 支持掩码穿透的时序注意力池化，彻底免疫填充0的毒化"""
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int, dropout: float = 0.25):
         super().__init__()
+        # 【SOTA 破壁注入】：在注意力生成核中引入强力 Dropout 逼迫机制
+        # 这将切断网络对单一显著特征的过度依赖，强迫 512 维潜变量形成真正的分布式表征
         self.attention = nn.Sequential(
             nn.Conv1d(in_channels, in_channels // 2, 1),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Conv1d(in_channels // 2, 1, 1)
         )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         # x shape: [B, C, L_down]
         attn_logits = self.attention(x)  # [B, 1, L_down]
-        
+
         # 【隔离脏数据】：强行将掩码为 0（缺失值）的区域注意力降至极低
         if mask is not None:
             attn_logits = attn_logits.masked_fill(mask == 0, -1e4)
-            
+
         w = F.softmax(attn_logits, dim=-1)  # [B, 1, L_down]
         return torch.sum(x * w, dim=-1)  # [B, C]
 
@@ -114,7 +113,7 @@ class PhysicsAwareUNet1D(nn.Module):
                  in_channels: int = 2,
                  out_channels: int = 1,
                  base_dim: int = 64,
-                 phys_dim: int = 6):
+                 phys_dim: int = 8):  # 【基座对齐】：必须对齐阶段二的 8 维正交特征！
         super().__init__()
         self.in_channels = in_channels
         self.cond_dim = base_dim * 4
@@ -136,19 +135,20 @@ class PhysicsAwareUNet1D(nn.Module):
 
         self.down1 = nn.ModuleList([ConvNeXtBlock1D(base_dim, base_dim, self.cond_dim), Downsample1D(base_dim)])
         self.down2 = nn.ModuleList([ConvNeXtBlock1D(base_dim, base_dim * 2, self.cond_dim), Downsample1D(base_dim * 2)])
-        self.down3 = nn.ModuleList([ConvNeXtBlock1D(base_dim * 2, base_dim * 4, self.cond_dim), Downsample1D(base_dim * 4)])
+        self.down3 = nn.ModuleList(
+            [ConvNeXtBlock1D(base_dim * 2, base_dim * 4, self.cond_dim), Downsample1D(base_dim * 4)])
 
         # 瓶颈层
         self.bot1 = ConvNeXtBlock1D(base_dim * 4, base_dim * 4, self.cond_dim)
         self.latent_pooler = TemporalAttentionPool(base_dim * 4)
         self.bot2 = ConvNeXtBlock1D(base_dim * 4, base_dim * 4, self.cond_dim)
 
-        # 【核心对齐】：输出维度从 1 改为 phys_dim(6维)，实施全维物理一致性正则
+        # 【核心对齐】：辅助头输出维度从 6 改为 phys_dim (8维)，执行全维极值能量一致性预测
         self.aux_head = nn.Sequential(
             nn.Linear(base_dim * 4, 128),
             nn.SiLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, phys_dim) 
+            nn.Linear(128, phys_dim)
         )
 
         self.up1 = nn.ModuleList([Upsample1D(base_dim * 4), ConvNeXtBlock1D(base_dim * 8, base_dim * 2, self.cond_dim)])
@@ -160,9 +160,8 @@ class PhysicsAwareUNet1D(nn.Module):
         nn.init.zeros_(self.outc.bias)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, phys_feats: torch.Tensor, return_latent: bool = False):
-        # 【掩码剥离】：剥离出第二个通道的真实掩码，准备将其穿透到网络最深处
-        raw_mask = x[:, 1:2, :] 
-        
+        raw_mask = x[:, 1:2, :]
+
         t_emb = self.time_mlp(t)
         p_emb = self.phys_mlp(phys_feats)
         cond = t_emb + p_emb
@@ -181,17 +180,15 @@ class PhysicsAwareUNet1D(nn.Module):
         mask_down = F.interpolate(raw_mask.float(), size=x.shape[-1], mode='nearest')
 
         if return_latent:
-            # 1. 免疫毒化的注意力池化
+            # 1. 免疫毒化的注意力池化 (已内置 Dropout 逼迫)
             lat_attn = self.latent_pooler(x, mask_down)  # [B, 256]
-            
-            # 2. 免疫毒化的全局最大池化 (强行将缺失区域置为负无穷)
+
+            # 2. 免疫毒化的全局最大池化
             x_masked = x.masked_fill(mask_down == 0, -1e4)
             lat_max = F.adaptive_max_pool1d(x_masked, 1).squeeze(-1)  # [B, 256]
-            
-            # 底层防御：如果该序列完全缺失，lat_max 会全为 -inf，将其清零防止崩溃
+
             lat_max = torch.where(torch.isinf(lat_max), torch.zeros_like(lat_max), lat_max)
-            
-            return torch.cat([lat_attn, lat_max], dim=-1)  # [B, 512] 满血重构且绝对纯净！
+            return torch.cat([lat_attn, lat_max], dim=-1)  # [B, 512]
 
         pred_phys = self.aux_head(self.latent_pooler(x, mask_down))
 
@@ -210,8 +207,9 @@ class PhysicsAwareUNet1D(nn.Module):
 # 3. 扩散过程管理器 (集成 Mask Input & DDIM 极速重构)
 # ==============================================================================
 class GaussianDiffusion1D(nn.Module):
+    # 【基座对齐】：默认 phys_dim 从 6 更新为 8
     def __init__(self, model: nn.Module, seq_length: int = 256, timesteps: int = 1000,
-                 beta_start: float = 1e-4, beta_end: float = 0.02, cond_drop_prob: float = 0.1, phys_dim: int = 6):
+                 beta_start: float = 1e-4, beta_end: float = 0.02, cond_drop_prob: float = 0.1, phys_dim: int = 8):
         super().__init__()
         self.model = model
         self.seq_length = seq_length
@@ -232,7 +230,6 @@ class GaussianDiffusion1D(nn.Module):
         return a[t].reshape(batch_size, *((1,) * (len(x_shape) - 1)))
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
-        """正向扩散：添加噪声"""
         if noise is None: noise = torch.randn_like(x_start)
         sqrt_alpha = self.extract(self.sqrt_alphas_cumprod, t, x_start.shape)
         sqrt_one_minus = self.extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
@@ -242,7 +239,6 @@ class GaussianDiffusion1D(nn.Module):
         B = x_residual.shape[0]
         x_noisy, noise = self.q_sample(x_residual, t)
 
-        # 把真实的掩码作为第二个通道塞给 U-Net，明确标定缺失位置
         model_input = torch.cat([x_noisy, mask], dim=1)
 
         drop_mask = (torch.rand(B, 1, device=x_residual.device) < self.cond_drop_prob).float()
@@ -309,7 +305,7 @@ class GaussianDiffusion1D(nn.Module):
 # 4. Unit Test
 # ==============================================================================
 if __name__ == "__main__":
-    print("🚀 测试 Next-Gen PGMA-Diff model.py (Mask-Aware Bottleneck Penetration) ...")
+    print("🚀 测试 Next-Gen PGMA-Diff model.py (Mask-Aware & 8-Dim Physics Align) ...")
 
     B, L = 8, 256
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -317,22 +313,21 @@ if __name__ == "__main__":
 
     x_residual = torch.randn(B, 1, L).to(device)
     x_mask = torch.ones(B, 1, L).to(device)
-    # 模拟其中一个序列存在大量缺失
-    x_mask[0, 0, 100:] = 0.0 
-    
-    phys_feats = torch.randn(B, 6).to(device)
+    x_mask[0, 0, 100:] = 0.0
+
+    phys_feats = torch.randn(B, 8).to(device)  # 【基座对齐测试】：物理特征验证为 8 维
     t = torch.randint(0, 1000, (B,), device=device).long()
 
-    unet = PhysicsAwareUNet1D(in_channels=2, out_channels=1, base_dim=64, phys_dim=6).to(device)
-    diffusion = GaussianDiffusion1D(unet, seq_length=L, timesteps=1000, cond_drop_prob=0.1, phys_dim=6).to(device)
+    unet = PhysicsAwareUNet1D(in_channels=2, out_channels=1, base_dim=64, phys_dim=8).to(device)
+    diffusion = GaussianDiffusion1D(unet, seq_length=L, timesteps=1000, cond_drop_prob=0.1, phys_dim=8).to(device)
 
     print("\n[Test 1] 训练态 Forward Pass...")
     noise_pred, noise, pred_phys = diffusion(x_residual, x_mask, t, phys_feats)
     print(f"   Noise Pred:   {noise_pred.shape} (Expect [B,1,256])")
-    print(f"   Pred Phys:    {pred_phys.shape} (Expect [B, 6]) - 全维正则生效！")
+    print(f"   Pred Phys:    {pred_phys.shape} (Expect [B, 8]) - 全维正则生效！")
 
     print("\n[Test 2] Phase 4 Latent Extraction (掩码穿透提取)...")
     latent_vector = diffusion.extract_latent_features(x_residual, x_mask, phys_feats)
     print(f"   Latent Vector:{latent_vector.shape} (Expect [B, 512])")
 
-    print("\n✅ 测试通过！瓶颈层毒化免疫与全维物理正则构建完成。")
+    print("\n✅ 测试通过！维度撕裂危险已排除，深层注意力破壁完成。")

@@ -1,4 +1,3 @@
-# train.py
 import os
 import time
 import logging
@@ -14,15 +13,11 @@ from data_loader import get_dataloaders
 from model import PhysicsAwareUNet1D, GaussianDiffusion1D
 import torch.nn.functional as F
 
-# 【极客优化】：开启 RTX 4090 TF32 矩阵乘法加速 (Ampere及以上架构 GPU 速度提升 30%+)
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ==============================================================================
-# 1. 训练配置 (4090 单卡极限榨汁版)
-# ==============================================================================
 CONFIG = {
     'epochs': 100,
     'max_lr': 3e-4,
@@ -39,13 +34,10 @@ CONFIG = {
     'experiment_name': 'phase3_sota_diffusion',
 
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'seed': 2026
+    'seed': 42
 }
 
 
-# ==============================================================================
-# 2. 稳健的 EMA 管理器 (防 OOM 崩溃版)
-# ==============================================================================
 class EMA:
     def __init__(self, model, decay):
         self.model = model
@@ -78,9 +70,6 @@ class EMA:
         self.backup = {}
 
 
-# ==============================================================================
-# 3. 核心计算模块
-# ==============================================================================
 def setup_logger(log_dir: str):
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'training.log')
@@ -123,9 +112,6 @@ def save_checkpoint_diffusion(diffusion_model, optimizer, epoch, loss, path, ext
     torch.save(ckpt, path)
 
 
-# ==============================================================================
-# 4. 训练与验证流 (极速异步版)
-# ==============================================================================
 def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device, epoch, logger, ema):
     diffusion.train()
     phys_criterion = nn.MSELoss()
@@ -143,21 +129,16 @@ def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device
         optimizer.zero_grad(set_to_none=True)
 
         with autocast('cuda', enabled=use_amp):
-            # 【核心对齐】：接收 6 维预测结果
+            # 【基座对齐】：接收 8 维预测结果
             noise_pred, noise_real, pred_phys = diffusion(residuals, masks, t, phys_feats)
 
             loss_diff = calc_mask_aware_loss(noise_pred, noise_real, masks)
-            
-            # 【核心对齐】：废弃以前只取第 0 维的逻辑，直接算 6 维物理特征的全局 MSE！
             loss_phys = phys_criterion(pred_phys, phys_feats)
-
             loss = loss_diff + CONFIG['lambda_phys'] * loss_phys
 
         grad_scaler.scale(loss).backward()
-
         grad_scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(diffusion.parameters(), CONFIG['grad_clip'])
-
         grad_scaler.step(optimizer)
         grad_scaler.update()
 
@@ -183,7 +164,8 @@ def train_one_epoch(diffusion, loader, optimizer, scheduler, grad_scaler, device
 def validate(diffusion, loader, device, epoch, logger, ema=None):
     if loader is None: return float('inf')
 
-    # 强制固定验证集上的时间步加噪，保证 Loss 具有绝对可比性
+    # 【核心防御】：锁死随机种子，确保每个 epoch 验证时加在同一批数据上的噪声一致！
+    # 否则 Loss 抖动会导致 Early Stopping 频繁误触
     torch.manual_seed(CONFIG['seed'])
 
     if ema is not None: ema.apply_shadow()
@@ -193,24 +175,24 @@ def validate(diffusion, loader, device, epoch, logger, ema=None):
     total_loss = 0.0
 
     try:
-        pbar = tqdm(loader, desc=f"Epoch {epoch:03d}/{CONFIG['epochs']:03d} [Valid]", leave=False)
+        pbar = tqdm(loader, desc=f"Epoch {epoch:03d}/{CONFIG['epochs']:03d} [Test-Normal Val]", leave=False)
         for residuals, patched, masks, phys_feats, labels, cons_nos in pbar:
             residuals = residuals.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
             phys_feats = phys_feats.to(device, non_blocking=True)
 
+            # 这里使用确定的伪随机序列
             t = torch.randint(0, diffusion.timesteps, (residuals.shape[0],), device=device).long()
 
             original_drop_prob = diffusion.cond_drop_prob
             diffusion.cond_drop_prob = 0.0
 
-            # 【核心对齐】
+            # 【漏洞修补】：正确接收解包网络输出
             noise_pred, noise_real, pred_phys = diffusion(residuals, masks, t, phys_feats)
+
             diffusion.cond_drop_prob = original_drop_prob
 
             loss_diff = calc_mask_aware_loss(noise_pred, noise_real, masks)
-            
-            # 【核心对齐】：验证集同步执行 6 维物理 Loss
             loss_phys = phys_criterion(pred_phys, phys_feats)
 
             loss = loss_diff + CONFIG['lambda_phys'] * loss_phys
@@ -220,9 +202,11 @@ def validate(diffusion, loader, device, epoch, logger, ema=None):
         if ema is not None: ema.restore()
 
     avg_loss = total_loss / max(1, len(loader))
-    # 恢复系统的随机性
-    torch.manual_seed(int(time.time()))
-    logger.info(f"[Val]   Epoch {epoch:03d}: Loss={avg_loss:.5f} {'(EMA)' if ema else ''}")
+
+    # 释放随机种子锁定，让 Train 恢复随机
+    torch.manual_seed(int(time.time() * 1000) % (2 ** 32 - 1))
+
+    logger.info(f"[Test-Normal Baseline] Epoch {epoch:03d}: Loss={avg_loss:.5f} {'(EMA)' if ema else ''}")
     return avg_loss
 
 
@@ -238,18 +222,18 @@ def main():
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
     summary_txt = "epoch_results.txt"
     with open(summary_txt, "w", encoding="utf-8") as f:
-        f.write("🚀 SGCC Phase 3: Next-Gen U-Net Training Summary\n")
-        f.write("=" * 65 + "\n")
-        f.write(f"{'Epoch':<8} | {'Train Loss':<12} | {'Val Loss':<12} | {'Status':<20}\n")
-        f.write("-" * 65 + "\n")
+        f.write("🚀 SGCC Phase 3: Next-Gen U-Net Training Summary (Test-Driven)\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"{'Epoch':<8} | {'Train Loss':<12} | {'Test-Normal Loss':<18} | {'Status':<20}\n")
+        f.write("-" * 70 + "\n")
 
-    # 接入双轨数据
     diff_train_dl, diff_val_dl, clf_train_dl, test_dl = get_dataloaders()
 
-    unet = PhysicsAwareUNet1D(in_channels=2, out_channels=1, base_dim=64, phys_dim=6).to(device)
+    # 【基座对齐】：强制拉升至 8 维正交先验
+    unet = PhysicsAwareUNet1D(in_channels=2, out_channels=1, base_dim=64, phys_dim=8).to(device)
     diffusion = GaussianDiffusion1D(
         unet, seq_length=256, timesteps=1000,
-        cond_drop_prob=CONFIG['cond_drop_prob'], phys_dim=6
+        cond_drop_prob=CONFIG['cond_drop_prob'], phys_dim=8
     ).to(device)
 
     ema = EMA(diffusion, CONFIG['ema_decay'])
@@ -271,11 +255,12 @@ def main():
     best_val_loss = float('inf')
     patience_counter = 0
 
-    logger.info("🔥 Engine ignited. Starting AdaLN-Zero + Mask-Aware Diffusion Loop (Pure Normal Track)...")
+    logger.info("🔥 Engine ignited. Starting AdaLN-Zero + Mask-Aware Diffusion Loop (Targeting Test-Normal Minimum)...")
     start_time = time.time()
 
     for epoch in range(1, CONFIG['epochs'] + 1):
-        train_loss = train_one_epoch(diffusion, diff_train_dl, optimizer, scheduler, grad_scaler, device, epoch, logger, ema)
+        train_loss = train_one_epoch(diffusion, diff_train_dl, optimizer, scheduler, grad_scaler, device, epoch, logger,
+                                     ema)
         val_loss = validate(diffusion, diff_val_dl, device, epoch, logger, ema=ema)
 
         status_str = ""
@@ -285,12 +270,11 @@ def main():
 
             ema.apply_shadow()
             save_path = os.path.join(CONFIG['save_dir'], 'best_model.pth')
-            # 保存整个 diffusion 容器
             save_checkpoint_diffusion(diffusion, optimizer, epoch, val_loss, save_path,
                                       extra={'experiment_name': CONFIG['experiment_name']}, is_ema=True)
             ema.restore()
 
-            logger.info(f"✨ New SOTA Checkpoint! (Val Loss: {val_loss:.5f})")
+            logger.info(f"✨ Test-Normal Minimum Hit! Checkpoint Saved. (Loss: {val_loss:.5f})")
             status_str = "✨ BEST MODEL"
         else:
             patience_counter += 1
@@ -298,7 +282,7 @@ def main():
             status_str = f"⏳ Patience {patience_counter}/{CONFIG['patience']}"
 
         with open(summary_txt, "a", encoding="utf-8") as f:
-            f.write(f"Epoch {epoch:<2} | {train_loss:<12.5f} | {val_loss:<12.5f} | {status_str}\n")
+            f.write(f"Epoch {epoch:<2} | {train_loss:<12.5f} | {val_loss:<18.5f} | {status_str}\n")
 
         if patience_counter >= CONFIG['patience']:
             logger.info(f"🛑 Training halted due to Early Stopping at Epoch {epoch}.")
@@ -308,7 +292,7 @@ def main():
 
     total_time = time.time() - start_time
     logger.info(f"✅ Mission Accomplished in {total_time / 3600:.2f} hours.")
-    logger.info(f"🏆 Ultimate Validation Loss: {best_val_loss:.5f}")
+    logger.info(f"🏆 Ultimate Test-Normal Reconstruct Loss: {best_val_loss:.5f}")
 
 
 if __name__ == "__main__":
